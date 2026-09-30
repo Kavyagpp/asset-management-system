@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Asset ledger</title>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@600;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#e8ebe4;--panel:#f7f8f4;--ink:#16221e;--mute:#5d6b64;--line:#c9d0c4;--pri:#1f3d34;--hi:#e3b82f;--bad:#a8321f;--ok:#2d6a4f}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 Barlow,system-ui,sans-serif}
+h1,h2{font-family:'Barlow Condensed',Barlow,sans-serif;margin:0;letter-spacing:.01em}
+h2{font-size:1.5rem;margin-bottom:.9rem}
+header{background:var(--pri);color:#fff;display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:.7rem 1.2rem}
+header h1{font-size:1.6rem}
+header span{opacity:.85;margin-right:.8rem}
+nav{display:flex;gap:.2rem;padding:0 1.2rem;background:var(--panel);border-bottom:1px solid var(--line);overflow-x:auto}
+nav button{background:none;border:0;border-bottom:3px solid transparent;border-radius:0;color:var(--mute);padding:.8rem 1rem;font-weight:500;cursor:pointer}
+nav button[aria-current=page]{color:var(--ink);border-bottom-color:var(--hi)}
+main{max-width:1050px;margin:1.4rem auto;padding:0 1.2rem}
+button{font:inherit;font-weight:600;background:var(--pri);color:#fff;border:0;border-radius:4px;padding:.6rem 1.1rem;cursor:pointer}
+button:disabled{opacity:.5;cursor:wait}
+button.ghost{background:none;border:1px solid var(--line);color:var(--ink);padding:.3rem .7rem;font-weight:500}
+header button{background:none;border:1px solid #ffffff66}
+input,select{font:inherit;width:100%;padding:.55rem .6rem;border:1px solid var(--line);border-radius:4px;background:#fff;color:var(--ink)}
+:focus-visible{outline:2px solid var(--hi);outline-offset:2px}
+label{display:block;font-weight:500;margin-bottom:.8rem}
+label>input,label>select{margin-top:.25rem;font-weight:400}
+.form,.card{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:1.2rem}
+.form{max-width:420px}
+.split{display:grid;grid-template-columns:340px 1fr;gap:1.2rem;align-items:start}
+.bar{margin-bottom:.8rem;max-width:340px}
+.tw{background:var(--panel);border:1px solid var(--line);border-radius:6px;overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:.6rem .8rem;border-bottom:1px solid var(--line);white-space:nowrap}
+th{background:#dfe4d9;font-weight:600}
+tr:last-child td{border-bottom:0}
+.n{text-align:right;font-variant-numeric:tabular-nums}
+.empty{color:var(--mute);white-space:normal}
+.login{max-width:380px;margin:12vh auto;padding:0 1.2rem}
+.login h1{font-size:2.4rem;margin-bottom:1rem}
+.login button{width:100%}
+#toast{position:fixed;left:50%;bottom:1.2rem;transform:translateX(-50%);background:var(--ok);color:#fff;padding:.7rem 1.1rem;border-radius:4px;opacity:0;pointer-events:none;transition:opacity .2s;max-width:90vw}
+#toast.show{opacity:1}#toast.bad{background:var(--bad)}
+@media(max-width:800px){.split{grid-template-columns:1fr}}
+@media(prefers-reduced-motion:reduce){#toast{transition:none}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<div id="toast" role="status"></div>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const opts = (arr, val, lab, sel) => arr.map(x => `<option value="${esc(x[val])}"${x[val] == sel ? ' selected' : ''}>${esc(typeof lab === 'function' ? lab(x) : x[lab])}</option>`).join('');
+const field = (label, inner) => `<label>${label}${inner}</label>`;
+const fmt = d => new Date(d).toLocaleString();
+const ROLE = { admin: 'Admin', base_commander: 'Base commander', logistics: 'Logistics' };
+
+let S = { token: localStorage.getItem('token'), user: JSON.parse(localStorage.getItem('user') || 'null'), bases: [], types: [], users: [], tab: 'inventory' };
+
+function toast(msg, bad) {
+  const t = $('#toast'); t.textContent = msg; t.className = 'show' + (bad ? ' bad' : '');
+  clearTimeout(toast.h); toast.h = setTimeout(() => t.className = '', 3500);
+}
+
+async function api(path, o = {}) {
+  const r = await fetch(path, {
+    method: o.method || 'GET',
+    headers: { 'Content-Type': 'application/json', ...(S.token ? { Authorization: 'Bearer ' + S.token } : {}) },
+    body: o.body ? JSON.stringify(o.body) : undefined
+  });
+  const d = await r.json().catch(() => ({}));
+  if (r.status === 401 && path !== '/auth/login') { logout(); throw new Error('Session expired. Sign in again.'); }
+  if (!r.ok) throw new Error(d.error || 'Request failed');
+  return d;
+}
+
+async function send(e, path, body, ok, after) {
+  e.preventDefault();
+  const form = e.target, b = form.querySelector('button[type=submit],button:not([type])');
+  b.disabled = true;
+  try { await api(path, { method: 'POST', body }); toast(ok); form.reset(); if (after) await after(); }
+  catch (x) { toast(x.message, true); }
+  b.disabled = false;
+}
+
+const ownBase = () => S.user.role === 'admin' ? null : S.user.baseId;
+function baseSelect(id, label, lockToOwn = true) {
+  const ob = lockToOwn ? ownBase() : null;
+  const list = ob ? S.bases.filter(b => b.id == ob) : S.bases;
+  return field(label, `<select id="${id}" required>${ob ? '' : '<option value="">Choose base</option>'}${opts(list, 'id', 'name')}</select>`);
+}
+const typeSelect = () => field('Asset type', `<select id="type" required><option value="">Choose asset type</option>${opts(S.types, 'id', t => `${t.name} (${t.category})`)}</select>`);
+
+const TABS = {
+  inventory: { label: 'Inventory', roles: ['admin', 'base_commander', 'logistics'] },
+  purchase:  { label: 'Purchases', roles: ['admin', 'logistics'] },
+  transfer:  { label: 'Transfers', roles: ['admin', 'logistics'] },
+  assign:    { label: 'Assignments', roles: ['admin', 'base_commander'] },
+  audit:     { label: 'Audit log', roles: ['admin'] }
+};
+
+const views = {
+  async inventory(el) {
+    const rows = await api('/api/inventory');
+    el.innerHTML = `<h2>Inventory</h2><div class="bar"><input id="q" placeholder="Filter by base or asset" aria-label="Filter inventory"></div>
+      <div class="tw"><table><thead><tr><th>Base</th><th>Asset</th><th class="n">On hand</th></tr></thead><tbody id="tb"></tbody></table></div>`;
+    const draw = () => {
+      const q = $('#q').value.toLowerCase();
+      const r = rows.filter(x => (x.base + ' ' + x.asset).toLowerCase().includes(q));
+      $('#tb').innerHTML = r.length ? r.map(x => `<tr><td>${esc(x.base)}</td><td>${esc(x.asset)}</td><td class="n">${x.quantity}</td></tr>`).join('')
+        : '<tr><td colspan="3" class="empty">No stock found. Record a purchase to add some.</td></tr>';
+    };
+    $('#q').oninput = draw; draw();
+  },
+
+  purchase(el) {
+    el.innerHTML = `<form id="f" class="form"><h2>Record a purchase</h2>
+      ${baseSelect('base', 'Base')}${typeSelect()}
+      ${field('Quantity', '<input id="qty" type="number" min="1" required>')}
+      ${field('Unit cost', '<input id="cost" type="number" min="0" step="0.01" required>')}
+      <button>Save purchase</button></form>`;
+    $('#f').onsubmit = e => send(e, '/api/purchases',
+      { baseId: +$('#base').value, assetTypeId: +$('#type').value, quantity: +$('#qty').value, unitCost: +$('#cost').value }, 'Purchase saved');
+  },
+
+  transfer(el) {
+    el.innerHTML = `<form id="f" class="form"><h2>Transfer stock</h2>
+      ${baseSelect('from', 'From base')}${baseSelect('to', 'To base', false)}${typeSelect()}
+      ${field('Quantity', '<input id="qty" type="number" min="1" required>')}
+      <button>Transfer stock</button></form>`;
+    $('#f').onsubmit = e => {
+      const fromBaseId = +$('#from').value, toBaseId = +$('#to').value;
+      if (fromBaseId === toBaseId) { e.preventDefault(); return toast('Choose two different bases.', true); }
+      send(e, '/api/transfers', { fromBaseId, toBaseId, assetTypeId: +$('#type').value, quantity: +$('#qty').value }, 'Transfer saved');
+    };
+  },
+
+  async assign(el) {
+    const act = await api('/api/assignments');
+    const users = S.user.role === 'admin' ? S.users : S.users.filter(u => u.base_id == S.user.baseId);
+    el.innerHTML = `<div class="split"><form id="f" class="form"><h2>Assign an asset</h2>
+      ${baseSelect('base', 'Base')}${typeSelect()}
+      ${field('Assign to', `<select id="to" required><option value="">Choose person</option>${opts(users, 'id', 'name')}</select>`)}
+      ${field('Quantity', '<input id="qty" type="number" min="1" required>')}
+      <button>Assign asset</button></form>
+      <div><h2>Currently assigned</h2><div class="tw"><table><thead><tr><th>Asset</th><th>Base</th><th>Assigned to</th><th class="n">Qty</th><th>Since</th><th></th></tr></thead><tbody>
+      ${act.length ? act.map(a => `<tr><td>${esc(a.asset)}</td><td>${esc(a.base)}</td><td>${esc(a.assigned_to_name)}</td><td class="n">${a.quantity}</td><td>${fmt(a.assigned_at)}</td><td><button class="ghost" data-id="${a.id}">Mark returned</button></td></tr>`).join('')
+        : '<tr><td colspan="6" class="empty">Nothing is assigned right now.</td></tr>'}
+      </tbody></table></div></div></div>`;
+    $('#f').onsubmit = e => send(e, '/api/assignments',
+      { baseId: +$('#base').value, assetTypeId: +$('#type').value, assignedTo: +$('#to').value, quantity: +$('#qty').value }, 'Asset assigned', () => views.assign(el));
+    el.querySelectorAll('button[data-id]').forEach(b => b.onclick = async () => {
+      b.disabled = true;
+      try { await api(`/api/assignments/${b.dataset.id}/return`, { method: 'POST' }); toast('Asset returned'); views.assign(el); }
+      catch (x) { toast(x.message, true); b.disabled = false; }
+    });
+  },
+
+  async audit(el) {
+    const rows = await api('/api/audit');
+    el.innerHTML = `<h2>Audit log</h2><div class="tw"><table><thead><tr><th>When</th><th>User ID</th><th>Action</th><th>Record</th><th>Details</th></tr></thead><tbody>
+      ${rows.length ? rows.map(r => `<tr><td>${fmt(r.created_at)}</td><td>${esc(r.user_id)}</td><td>${esc(r.action)}</td><td>${esc(r.entity)} #${esc(r.entity_id)}</td><td title="${esc(JSON.stringify(r.details))}">${esc(JSON.stringify(r.details).slice(0, 70))}</td></tr>`).join('')
+        : '<tr><td colspan="5" class="empty">No activity recorded yet.</td></tr>'}
+      </tbody></table></div>`;
+  }
+};
+
+async function show(tab) {
+  S.tab = tab;
+  document.querySelectorAll('nav button').forEach(b => b.setAttribute('aria-current', b.dataset.tab === tab ? 'page' : 'false'));
+  const el = $('#view');
+  el.innerHTML = '<p class="empty">Loading…</p>';
+  try { await views[tab](el); } catch (x) { el.innerHTML = `<p class="empty">${esc(x.message)}</p>`; }
+}
+
+async function renderApp() {
+  try {
+    [S.bases, S.types, S.users] = await Promise.all([api('/api/bases'), api('/api/asset-types'), api('/api/users')]);
+  } catch (x) { return renderLogin(x.message); }
+  const tabs = Object.entries(TABS).filter(([, t]) => t.roles.includes(S.user.role));
+  $('#root').innerHTML = `<header><h1>Asset ledger</h1><div><span>${esc(S.user.name)} · ${ROLE[S.user.role] || esc(S.user.role)}</span><button id="out">Sign out</button></div></header>
+    <nav aria-label="Sections">${tabs.map(([k, t]) => `<button data-tab="${k}">${t.label}</button>`).join('')}</nav><main id="view"></main>`;
+  $('#out').onclick = logout;
+  document.querySelectorAll('nav button').forEach(b => b.onclick = () => show(b.dataset.tab));
+  show(tabs[0][0]);
+}
+
+function renderLogin(msg) {
+  $('#root').innerHTML = `<div class="login"><h1>Asset ledger</h1><form id="lf" class="card">
+    ${field('Email', '<input id="em" type="email" autocomplete="username" required>')}
+    ${field('Password', '<input id="pw" type="password" autocomplete="current-password" required>')}
+    <button>Sign in</button></form></div>`;
+  if (msg) toast(msg, true);
+  $('#lf').onsubmit = async e => {
+    e.preventDefault();
+    try {
+      const d = await api('/auth/login', { method: 'POST', body: { email: $('#em').value, password: $('#pw').value } });
+      S.token = d.token; S.user = d.user;
+      localStorage.setItem('token', d.token); localStorage.setItem('user', JSON.stringify(d.user));
+      renderApp();
+    } catch (x) { toast(x.message, true); }
+  };
+}
+
+function logout() {
+  S.token = null; S.user = null;
+  localStorage.removeItem('token'); localStorage.removeItem('user');
+  renderLogin();
+}
+
+S.token && S.user ? renderApp() : renderLogin();
+</script>
+</body>
+</html>
